@@ -24,5 +24,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\carlo\\GERADOR_CORRENTE\\build"
-  ]
+  ],
+  "idf.currentSetup": "C:\\esp\\v6.1.1\\esp-idf"
 }
