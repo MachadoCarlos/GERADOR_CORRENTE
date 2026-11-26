@@ -3,7 +3,7 @@
     {
       "name": "ESP-IDF",
       "compilerPath": "",
-      "compileCommands": "${config:idf.buildPath}/compile_commands.json",
+      "compileCommands": "c:\\Users\\carlo\\GERADOR_CORRENTE\\build\\compile_commands.json",
       "intelliSenseMode": "gcc-x86",
       "includePath": [
         "${workspaceFolder}/**"
