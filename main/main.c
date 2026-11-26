@@ -8,15 +8,26 @@
 #include "esp_lcd_ili9341.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/i2c_master.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h" 
 
-
 #include "ui/ui.h"
+#include "ina226.h"
 
 
+/* Definicoes de hardware do barramento I2C */
+#define I2C_PORT            I2C_NUM_0
+#define I2C_PIN_SDA         GPIO_NUM_21
+#define I2C_PIN_SCL         GPIO_NUM_22
+#define I2C_FREQ_HZ         400000
+#define I2C_TIMEOUT_MS      100
 
+/* Parametros do circuito de medicao */
+#define INA226_ENDERECO     INA226_DEFAULT_ADDR  /* 0x40 (A1=GND, A0=GND) */
+#define SHUNT_OHMS          0.1f                 /* Resistor shunt de 0.1 Ohm (R100) */
+#define CORRENTE_MAX_A      3.2f                 /* Corrente maxima esperada em Amperes */
 
 #define LCD_HOST           SPI2_HOST 
 #define LCD_PIXEL_CLOCK_HZ (40 * 1000 * 1000)
@@ -201,9 +212,78 @@ void app_main(void)
     ui_init();
     lvgl_port_unlock();
 
-    ESP_LOGI(TAG, "Sistema inicializado com sucesso!");
+    ESP_LOGI(TAG, "LVGL inicializado com sucesso!");
+
+
+    uint8_t txBuf[3] = {0};
+    uint8_t rxBuf[2] = {0};
+    uint8_t regAddr  = 0;
+    ina226_escala_t escala = {0};
+
+    /* 1. Inicializa o barramento I2C Master usando a API nativa do ESP-IDF 6 */
+    i2c_master_bus_config_t busConfig = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_PORT,
+        .scl_io_num = I2C_PIN_SCL,
+        .sda_io_num = I2C_PIN_SDA,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+
+    i2c_master_bus_handle_t busHandle = NULL;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&busConfig, &busHandle));
+
+    /* 2. Registra o dispositivo INA226 no barramento */
+    i2c_device_config_t devConfig = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = INA226_ENDERECO,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+
+    i2c_master_dev_handle_t ina226Handle = NULL;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(busHandle, &devConfig, &ina226Handle));
+
+    /* 3. Verifica a identidade do chip no barramento (Manufacturer ID = 0x5449) */
+    regAddr = INA226_REG_MANUF_ID;
+    ESP_ERROR_CHECK(i2c_master_transmit_receive(ina226Handle, &regAddr, 1, rxBuf, sizeof(rxBuf), I2C_TIMEOUT_MS));
+
+    if (!INA226_ValidarManufId(rxBuf)) {
+        ESP_LOGE(TAG, "INA226 nao encontrado no endereco 0x%02X", INA226_ENDERECO);
+        return;
+    }
+
+    /* 4. Executa reset por software no INA226 */
+    INA226_MontarReset(txBuf);
+    ESP_ERROR_CHECK(i2c_master_transmit(ina226Handle, txBuf, sizeof(txBuf), I2C_TIMEOUT_MS));
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* 5. Envia a configuracao de operacao (Media 16x, 1.1 ms de conversao, modo continuo) */
+    ina226_config_t inaConfig = {
+        .media = INA226_AVG_16,
+        .tempoConvVbus = INA226_CONV_1100US,
+        .tempoConvShunt = INA226_CONV_1100US,
+        .modo = INA226_MODE_SHUNT_BUS_CONT
+    };
+    INA226_MontarConfig(&inaConfig, txBuf);
+    ESP_ERROR_CHECK(i2c_master_transmit(ina226Handle, txBuf, sizeof(txBuf), I2C_TIMEOUT_MS));
+
+    /* 6. Calcula e grava o registrador de calibracao (0x05) */
+    INA226_MontarCalibracao(SHUNT_OHMS, CORRENTE_MAX_A, &escala, txBuf);
+    ESP_ERROR_CHECK(i2c_master_transmit(ina226Handle, txBuf, sizeof(txBuf), I2C_TIMEOUT_MS));
+
+    ESP_LOGI(TAG, "INA226 inicializado (Shunt: %.3f Ohms | LSB: %.3f uA)",
+             escala.shuntOhms, escala.currentLsb * 1000000.0f);
     
     while (1) {
+        regAddr = INA226_REG_CURRENT;
+        esp_err_t ret = i2c_master_transmit_receive(ina226Handle, &regAddr, 1, rxBuf, sizeof(rxBuf), I2C_TIMEOUT_MS);
+
+        if (ret == ESP_OK) {
+            float correnteA = INA226_ConverterCorrenteA(&escala, rxBuf);
+            ESP_LOGI(TAG, "Corrente: %.4f A (%.2f mA)", correnteA, correnteA * 1000.0f);
+        } else {
+            ESP_LOGW(TAG, "Falha na leitura I2C: %s", esp_err_to_name(ret));
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
