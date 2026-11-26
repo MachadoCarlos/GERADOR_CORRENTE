@@ -1,147 +1,199 @@
-/**
- * @file ina226.c
- * @brief Implementacao das funcoes de protocolo e calculo do driver INA226.
- */
-
-#include <math.h>
 #include "ina226.h"
 
-/* ============================================================================
- * Constantes Internas Definidas pelo Datasheet do INA226
- * ============================================================================ */
+/** @brief Constante interna fixa do datasheet INA226 (Equacao 1: 0.00512) */
+#define INA226_CALIBRATION_CONST        0.00512f
 
-/** @brief Mascara do bit 15 (RST) do registrador 0x00 para reset por software. */
-#define INA226_CFG_RESET_BIT        (1U << 15)
+/** @brief Divisor de resolucao de 15 bits para Current_LSB (2^15 = 32768) */
+#define INA226_CURRENT_LSB_DIVISOR      32768.0f
 
-/** @brief Bit 14 do registrador 0x00 deve ser mantido em 1 conforme datasheet (0x4000). */
-#define INA226_CFG_FIXED_BIT        (1U << 14)
+/** @brief Valor maximo permitido no registrador de calibracao (15 bits) */
+#define INA226_MAX_CALIBRATION_VAL      32767U
 
-/** @brief Resolucao fixa do ADC diferencial do shunt: 2.5 microvolts por bit. */
-#define INA226_SHUNT_V_LSB_UV       2.5f
+/** @brief LSB fixo da tensao de shunt: 2.5 uV */
+#define INA226_SHUNT_VOLTAGE_LSB_V      0.0000025f
 
-/** @brief Resolucao fixa do ADC de tensao de barramento: 1.25 milivolts por bit. */
-#define INA226_BUS_V_LSB_MV         1.25f
+/** @brief LSB fixo da tensao de barramento: 1.25 mV */
+#define INA226_BUS_VOLTAGE_LSB_V        0.00125f
 
-/** @brief Constante interna fixa de escalonamento da equacao de calibracao do chip. */
-#define INA226_CALIB_CONST          0.00512f
+/** @brief Multiplicador fixo de Power_LSB em relacao ao Current_LSB (25x) */
+#define INA226_POWER_LSB_MULTIPLIER     25.0f
 
-/* ============================================================================
- * Implementacao das Funcoes de Montagem de Pacotes (TX)
- * ============================================================================ */
+/** @brief Bit 15 de reset do registrador de configuracao */
+#define INA226_CONFIG_RESET_BIT         0x8000U
 
-void INA226_MontarEscritaReg(uint8_t reg, uint16_t valor, uint8_t outBuf[3])
+/** @brief Bits reservados obrigatorios (bits 14..12 = 100b -> 0x4000) */
+#define INA226_CONFIG_RESERVED_BITS     0x4000U
+
+INA226_Status_t INA226_Init(
+    INA226_Handle_t *handle,
+    uint8_t i2cAddress,
+    float shuntResistorOhms,
+    float maxExpectedCurrentAmps)
 {
-    if (!outBuf) {
-        return;
+    if (handle == NULL) {
+        return INA226_STATUS_ERR_NULL_PTR;
     }
 
-    /* O INA226 utiliza protocolo Big-Endian: primeiro o byte mais significativo */
-    outBuf[0] = reg;
-    outBuf[1] = (uint8_t)((valor >> 8) & 0xFFU);
-    outBuf[2] = (uint8_t)(valor & 0xFFU);
-}
-
-void INA226_MontarConfig(const ina226_config_t *cfg, uint8_t outBuf[3])
-{
-    if (!cfg || !outBuf) {
-        return;
+    if ((i2cAddress > 0x7FU) || (shuntResistorOhms <= 0.0f) || (maxExpectedCurrentAmps <= 0.0f)) {
+        return INA226_STATUS_ERR_INVALID_ARG;
     }
 
-    /* Monta a palavra de 16 bits deslocando cada campo para sua posicao no registrador 0x00 */
-    uint16_t regVal = INA226_CFG_FIXED_BIT |
-                      ((uint16_t)(cfg->media & 0x07U) << 9) |
-                      ((uint16_t)(cfg->tempoConvVbus & 0x07U) << 6) |
-                      ((uint16_t)(cfg->tempoConvShunt & 0x07U) << 3) |
-                      ((uint16_t)(cfg->modo & 0x07U));
+    float currentLsb = maxExpectedCurrentAmps / INA226_CURRENT_LSB_DIVISOR;
+    float calFloat = INA226_CALIBRATION_CONST / (currentLsb * shuntResistorOhms);
 
-    INA226_MontarEscritaReg(INA226_REG_CONFIG, regVal, outBuf);
-}
-
-void INA226_MontarReset(uint8_t outBuf[3])
-{
-    INA226_MontarEscritaReg(INA226_REG_CONFIG, INA226_CFG_RESET_BIT, outBuf);
-}
-
-void INA226_MontarCalibracao(float shuntOhms, float correnteMaxA, ina226_escala_t *outEscala, uint8_t outBuf[3])
-{
-    if (!outEscala || !outBuf || shuntOhms <= 0.0f || correnteMaxA <= 0.0f) {
-        return;
+    if (calFloat > (float)INA226_MAX_CALIBRATION_VAL) {
+        return INA226_STATUS_ERR_CAL_OVERFLOW;
     }
 
-    /* Divide a corrente maxima esperada pelos 15 bits uteis de magnitude (2^15 = 32768) */
-    outEscala->shuntOhms = shuntOhms;
-    outEscala->currentLsb = correnteMaxA / 32768.0f;
+    handle->i2cAddress = i2cAddress;
+    handle->shuntResistorOhms = shuntResistorOhms;
+    handle->currentLsbAmps = currentLsb;
+    handle->powerLsbWatts = currentLsb * INA226_POWER_LSB_MULTIPLIER;
+    handle->calibrationReg = (uint16_t)calFloat;
+    handle->txLength = 0U;
 
-    /* Pela arquitetura interna do INA226, o LSB de potencia e sempre 25x o LSB de corrente */
-    outEscala->powerLsb = 25.0f * outEscala->currentLsb;
-
-    /* Calcula o valor inteiro de 15 bits a ser gravado no registrador 0x05 */
-    uint16_t calVal = (uint16_t)truncf(INA226_CALIB_CONST / (outEscala->currentLsb * shuntOhms));
-
-    INA226_MontarEscritaReg(INA226_REG_CALIBRATION, calVal, outBuf);
-}
-
-/* ============================================================================
- * Implementacao das Funcoes de Decodificacao e Conversao (RX)
- * ============================================================================ */
-
-uint16_t INA226_DecodificarU16(const uint8_t rxBuf[2])
-{
-    if (!rxBuf) {
-        return 0;
+    for (size_t i = 0U; i < sizeof(handle->txBuffer); i++) {
+        handle->txBuffer[i] = 0U;
     }
 
-    /* Reconstroi a palavra de 16 bits a partir dos dois bytes recebidos em Big-Endian */
-    return ((uint16_t)rxBuf[0] << 8) | (uint16_t)rxBuf[1];
-}
-
-bool INA226_ValidarManufId(const uint8_t rxBuf[2])
-{
-    return (INA226_DecodificarU16(rxBuf) == INA226_MANUF_ID_EXPECTED);
-}
-
-bool INA226_ValidarDieId(const uint8_t rxBuf[2])
-{
-    return (INA226_DecodificarU16(rxBuf) == INA226_DIE_ID_EXPECTED);
-}
-
-float INA226_ConverterTensaoBusV(const uint8_t rxBuf[2])
-{
-    uint16_t raw = INA226_DecodificarU16(rxBuf);
-
-    /* Converte de unidades de 1.25 mV para Volts */
-    return ((float)raw * INA226_BUS_V_LSB_MV) / 1000.0f;
-}
-
-float INA226_ConverterTensaoShuntMv(const uint8_t rxBuf[2])
-{
-    /* Cast explicito para int16_t preserva o sinal negativo (complemento de dois) */
-    int16_t raw = (int16_t)INA226_DecodificarU16(rxBuf);
-
-    /* Converte de unidades de 2.5 uV para milivolts */
-    return ((float)raw * INA226_SHUNT_V_LSB_UV) / 1000.0f;
-}
-
-float INA226_ConverterCorrenteA(const ina226_escala_t *escala, const uint8_t rxBuf[2])
-{
-    if (!escala) {
-        return 0.0f;
+    for (size_t i = 0U; i < sizeof(handle->rxBuffer); i++) {
+        handle->rxBuffer[i] = 0U;
     }
 
-    /* O registrador 0x04 e assinado (int16_t) para permitir medicoes bidirecionais */
-    int16_t raw = (int16_t)INA226_DecodificarU16(rxBuf);
-
-    return (float)raw * escala->currentLsb;
+    return INA226_STATUS_OK;
 }
 
-float INA226_ConverterPotenciaW(const ina226_escala_t *escala, const uint8_t rxBuf[2])
+INA226_Status_t INA226_BuildConfigFrame(
+    INA226_Handle_t *handle,
+    INA226_Averaging_t avg,
+    INA226_ConvTime_t busConvTime,
+    INA226_ConvTime_t shuntConvTime,
+    INA226_OperatingMode_t mode)
 {
-    if (!escala) {
-        return 0.0f;
+    if (handle == NULL) {
+        return INA226_STATUS_ERR_NULL_PTR;
     }
 
-    /* O registrador 0x03 e sempre sem sinal (uint16_t) */
-    uint16_t raw = INA226_DecodificarU16(rxBuf);
+    /*
+     * Mapa de bits do registrador 0x00 (Configuration):
+     * Bit 15: RST (0)
+     * Bits 14..12: Reservado (100b)
+     * Bits 11..9: AVG[2:0]
+     * Bits 8..6: VBUSCT[2:0]
+     * Bits 5..3: VSHCT[2:0]
+     * Bits 2..0: MODE[2:0]
+     */
+    uint16_t configWord = INA226_CONFIG_RESERVED_BITS
+                        | (((uint16_t)avg & 0x07U) << 9U)
+                        | (((uint16_t)busConvTime & 0x07U) << 6U)
+                        | (((uint16_t)shuntConvTime & 0x07U) << 3U)
+                        | ((uint16_t)mode & 0x07U);
 
-    return (float)raw * escala->powerLsb;
+    handle->txBuffer[0] = INA226_REG_CONFIG;
+    handle->txBuffer[1] = (uint8_t)((configWord >> 8U) & 0xFFU);
+    handle->txBuffer[2] = (uint8_t)(configWord & 0xFFU);
+    handle->txLength = INA226_FRAME_SIZE_WRITE;
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_BuildCalibrationFrame(INA226_Handle_t *handle)
+{
+    if (handle == NULL) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    handle->txBuffer[0] = INA226_REG_CALIBRATION;
+    handle->txBuffer[1] = (uint8_t)((handle->calibrationReg >> 8U) & 0xFFU);
+    handle->txBuffer[2] = (uint8_t)(handle->calibrationReg & 0xFFU);
+    handle->txLength = INA226_FRAME_SIZE_WRITE;
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_BuildResetFrame(INA226_Handle_t *handle)
+{
+    if (handle == NULL) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    uint16_t resetWord = INA226_CONFIG_RESET_BIT | INA226_CONFIG_RESERVED_BITS;
+
+    handle->txBuffer[0] = INA226_REG_CONFIG;
+    handle->txBuffer[1] = (uint8_t)((resetWord >> 8U) & 0xFFU);
+    handle->txBuffer[2] = (uint8_t)(resetWord & 0xFFU);
+    handle->txLength = INA226_FRAME_SIZE_WRITE;
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_BuildReadPointerFrame(INA226_Handle_t *handle, uint8_t regAddress)
+{
+    if (handle == NULL) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    handle->txBuffer[0] = regAddress;
+    handle->txLength = 1U;
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_ParseRawU16(const INA226_Handle_t *handle, uint16_t *outRawValue)
+{
+    if ((handle == NULL) || (outRawValue == NULL)) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    *outRawValue = (uint16_t)(((uint16_t)handle->rxBuffer[0] << 8U) | (uint16_t)handle->rxBuffer[1]);
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_ParseShuntVoltage(const INA226_Handle_t *handle, float *outShuntVolts)
+{
+    if ((handle == NULL) || (outShuntVolts == NULL)) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    int16_t rawSigned = (int16_t)(((uint16_t)handle->rxBuffer[0] << 8U) | (uint16_t)handle->rxBuffer[1]);
+    *outShuntVolts = (float)rawSigned * INA226_SHUNT_VOLTAGE_LSB_V;
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_ParseBusVoltage(const INA226_Handle_t *handle, float *outBusVolts)
+{
+    if ((handle == NULL) || (outBusVolts == NULL)) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    uint16_t rawUnsigned = (uint16_t)(((uint16_t)handle->rxBuffer[0] << 8U) | (uint16_t)handle->rxBuffer[1]);
+    *outBusVolts = (float)rawUnsigned * INA226_BUS_VOLTAGE_LSB_V;
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_ParseCurrent(const INA226_Handle_t *handle, float *outCurrentAmps)
+{
+    if ((handle == NULL) || (outCurrentAmps == NULL)) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    int16_t rawSigned = (int16_t)(((uint16_t)handle->rxBuffer[0] << 8U) | (uint16_t)handle->rxBuffer[1]);
+    *outCurrentAmps = (float)rawSigned * handle->currentLsbAmps;
+
+    return INA226_STATUS_OK;
+}
+
+INA226_Status_t INA226_ParsePower(const INA226_Handle_t *handle, float *outPowerWatts)
+{
+    if ((handle == NULL) || (outPowerWatts == NULL)) {
+        return INA226_STATUS_ERR_NULL_PTR;
+    }
+
+    uint16_t rawUnsigned = (uint16_t)(((uint16_t)handle->rxBuffer[0] << 8U) | (uint16_t)handle->rxBuffer[1]);
+    *outPowerWatts = (float)rawUnsigned * handle->powerLsbWatts;
+
+    return INA226_STATUS_OK;
 }
